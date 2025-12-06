@@ -1,384 +1,244 @@
 import cv2
 import numpy as np
+import math
 
+# --- ПАРАМЕТРИ ---
 params = {
-    'blur_d': 9,
-    'blur_sigma_color': 75,
-    'blur_sigma_space': 75,
-    'adapt_block_size': 15,
-    'adapt_c': 4,
-    'morph_open_iter': 2,
-    'morph_close_iter': 2,
-    'dilate_iter': 2,
-    'min_area': 200,
-    'max_area': 20000,
-    'min_circularity': 50,
+    'min_area': 500,  # Трохи збільшив, щоб відсіяти шуми
+    'max_area': 15000,
+    'min_circularity': 0.7,  # Більш сувора перевірка на коло
+    'match_dist_threshold': 80  # Радіус (в пікселях) для злиття монет на глобальній карті
 }
 
 
-def update_param(x):
-    pass
+class GlobalTracker:
+    def __init__(self):
+        self.global_transform = np.eye(3, dtype=np.float32)
+        self.coins = []
+        self.next_id = 1
+
+        # Параметри карти
+        self.map_size = 2000
+        self.map_img = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
+        self.map_center = np.array([self.map_size // 2, self.map_size // 2])
+
+    def update_camera_motion(self, prev_gray, curr_gray):
+        if prev_gray is None:
+            return False
+
+        # 1. Знаходимо точки (features) на попередньому кадрі
+        p0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=300, qualityLevel=0.01, minDistance=30)
+
+        if p0 is None or len(p0) < 8:
+            return False
+
+        # 2. Шукаємо ці точки на новому кадрі (Optical Flow)
+        p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None)
+
+        # 3. Відбираємо тільки ті, що знайшлися
+        good_new = p1[st == 1]
+        good_old = p0[st == 1]
+
+        if len(good_new) < 8:
+            return False
+
+        # 4. Обчислюємо матрицю трансформації (Translation + Rotation)
+        # Ransac відсіює точки, які рухаються неправильно (наприклад, відблиски на монетах)
+        m, inliers = cv2.estimateAffinePartial2D(good_old, good_new, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+
+        if m is None:
+            return False
+
+        # Важливо: ми рахуємо рух сцени відносно камери, тому беремо обернену трансформацію
+        # Щоб отримати рух камери по карті
+        m_inv = cv2.invertAffineTransform(m)
+
+        # Додаємо рядок [0, 0, 1]
+        m_3x3 = np.vstack([m_inv, [0, 0, 1]])
+
+        # Акумулюємо трансформацію
+        self.global_transform = self.global_transform @ m_3x3
+        return True
+
+    def frame_to_global(self, x, y):
+        vec = np.array([x, y, 1.0])
+        global_vec = self.global_transform @ vec
+        return global_vec[0], global_vec[1]
+
+    def global_to_map(self, gx, gy):
+        """Переводить глобальні координати в координати зображення карти (з центром)"""
+        return int(gx + self.map_center[0]), int(gy + self.map_center[1])
+
+    def process_detections(self, detections):
+        for det in detections:
+            gx, gy = self.frame_to_global(det['x'], det['y'])
+
+            # Пошук збігів
+            best_match = None
+            min_dist = float('inf')
+
+            for known_coin in self.coins:
+                dist = math.hypot(gx - known_coin['global_pos'][0], gy - known_coin['global_pos'][1])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match = known_coin
+
+            if best_match and min_dist < params['match_dist_threshold']:
+                # Оновлюємо існуючу монету
+                best_match['seen_count'] += 1
+                # Плавне уточнення координат (Low-pass filter)
+                alpha = 0.2
+                best_match['global_pos'] = (
+                    best_match['global_pos'][0] * (1 - alpha) + gx * alpha,
+                    best_match['global_pos'][1] * (1 - alpha) + gy * alpha
+                )
+                det['id'] = best_match['id']
+                det['is_new'] = False
+            else:
+                # Нова монета
+                new_coin = {
+                    'id': self.next_id,
+                    'global_pos': (gx, gy),
+                    'radius': det['r'],
+                    'seen_count': 1
+                }
+                self.coins.append(new_coin)
+                det['id'] = self.next_id
+                det['is_new'] = True
+                self.next_id += 1
+
+    def draw_map(self, frame_w, frame_h):
+        self.map_img.fill(20)  # Темно-сірий фон
+
+        # Малюємо сітку
+        cx, cy = self.map_center
+        cv2.line(self.map_img, (0, cy), (self.map_size, cy), (50, 50, 50), 1)
+        cv2.line(self.map_img, (cx, 0), (cx, self.map_size), (50, 50, 50), 1)
+
+        # 1. Малюємо монети
+        count = 0
+        for coin in self.coins:
+            if coin['seen_count'] > 10:  # Фільтр стабільності
+                count += 1
+                ix, iy = self.global_to_map(*coin['global_pos'])
+
+                if 0 <= ix < self.map_size and 0 <= iy < self.map_size:
+                    cv2.circle(self.map_img, (ix, iy), int(coin['radius']), (0, 255, 0), 2)
+                    cv2.circle(self.map_img, (ix, iy), 2, (0, 0, 255), -1)
+                    cv2.putText(self.map_img, str(coin['id']), (ix + 10, iy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        # 2. Малюємо поточне поле зору камери (прямокутник)
+        # Кути кадру в локальних координатах
+        corners = [(0, 0), (frame_w, 0), (frame_w, frame_h), (0, frame_h)]
+        map_corners = []
+        for x, y in corners:
+            gx, gy = self.frame_to_global(x, y)
+            map_corners.append(self.global_to_map(gx, gy))
+
+        pts = np.array(map_corners, np.int32)
+        pts = pts.reshape((-1, 1, 2))
+        cv2.polylines(self.map_img, [pts], True, (0, 255, 255), 2)
+
+        cv2.putText(self.map_img, f"Total Coins: {count}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+
+        # Ресайз для відображення, якщо карта занадто велика
+        return cv2.resize(self.map_img, (600, 600))
 
 
-def setup_trackbars():
-    cv2.namedWindow('Parameters')
-    cv2.createTrackbar('Blur D', 'Parameters', params['blur_d'], 25, update_param)
-    cv2.createTrackbar('Blur Sigma C', 'Parameters', params['blur_sigma_color'], 200, update_param)
-    cv2.createTrackbar('Blur Sigma S', 'Parameters', params['blur_sigma_space'], 200, update_param)
-    cv2.createTrackbar('Adapt Block', 'Parameters', params['adapt_block_size'], 51, update_param)
-    cv2.createTrackbar('Adapt C', 'Parameters', params['adapt_c'], 20, update_param)
-    cv2.createTrackbar('Morph Open', 'Parameters', params['morph_open_iter'], 10, update_param)
-    cv2.createTrackbar('Morph Close', 'Parameters', params['morph_close_iter'], 10, update_param)
-    cv2.createTrackbar('Dilate', 'Parameters', params['dilate_iter'], 10, update_param)
-    cv2.createTrackbar('Min Area', 'Parameters', params['min_area'], 2000, update_param)
-    cv2.createTrackbar('Max Area', 'Parameters', params['max_area'], 50000, update_param)
-    cv2.createTrackbar('Circularity x100', 'Parameters', params['min_circularity'], 100, update_param)
+def process_video(video_path, index):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error opening {video_path}")
+        return
 
-
-def get_current_params():
-    p = {}
-    p['blur_d'] = cv2.getTrackbarPos('Blur D', 'Parameters')
-    if p['blur_d'] % 2 == 0:
-        p['blur_d'] += 1
-    p['blur_d'] = max(1, p['blur_d'])
-
-    p['blur_sigma_color'] = cv2.getTrackbarPos('Blur Sigma C', 'Parameters')
-    p['blur_sigma_space'] = cv2.getTrackbarPos('Blur Sigma S', 'Parameters')
-
-    p['adapt_block_size'] = cv2.getTrackbarPos('Adapt Block', 'Parameters')
-    if p['adapt_block_size'] % 2 == 0:
-        p['adapt_block_size'] += 1
-    p['adapt_block_size'] = max(3, p['adapt_block_size'])
-
-    p['adapt_c'] = cv2.getTrackbarPos('Adapt C', 'Parameters')
-    p['morph_open_iter'] = cv2.getTrackbarPos('Morph Open', 'Parameters')
-    p['morph_close_iter'] = cv2.getTrackbarPos('Morph Close', 'Parameters')
-    p['dilate_iter'] = cv2.getTrackbarPos('Dilate', 'Parameters')
-    p['min_area'] = cv2.getTrackbarPos('Min Area', 'Parameters')
-    p['max_area'] = cv2.getTrackbarPos('Max Area', 'Parameters')
-    p['min_circularity'] = cv2.getTrackbarPos('Circularity x100', 'Parameters') / 100.0
-
-    return p
-
-
-def estimate_camera_motion(prev_gray, curr_gray):
-    try:
-        orb = cv2.ORB_create(nfeatures=500)
-        kp1, des1 = orb.detectAndCompute(prev_gray, None)
-        kp2, des2 = orb.detectAndCompute(curr_gray, None)
-
-        if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
-            return None
-
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = bf.match(des1, des2)
-        matches = sorted(matches, key=lambda x: x.distance)
-
-        if len(matches) < 10:
-            return None
-
-        good_matches = matches[:50]
-        pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches])
-        pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches])
-
-        M, mask = cv2.estimateAffinePartial2D(pts1, pts2, method=cv2.RANSAC, ransacReprojThreshold=5.0)
-        return M
-    except:
-        return None
-
-
-def transform_point(point, matrix):
-    if matrix is None:
-        return point
-    x, y = point
-    transformed = matrix @ np.array([x, y, 1])
-    return transformed[0], transformed[1]
-
-
-def check_video(cap, index, tuning_mode=False):
-    paused = False
-    tracked_coins = []
-    next_coin_id = 0
-
+    tracker = GlobalTracker()
     prev_gray = None
 
-    AREA_DIFF_THRESHOLD = 0.5
-    MIN_OBSERVATIONS = 3
-    DUPLICATE_THRESHOLD = 1.2
-    MATCH_THRESHOLD = 2.5
-    FORGET_FRAMES = 100
+    cv2.namedWindow("Result", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Map", cv2.WINDOW_NORMAL)
 
-    while cap.isOpened():
-        if not paused:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame = cv2.resize(frame, (640, 720), interpolation=cv2.INTER_CUBIC)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            if tuning_mode:
-                p = get_current_params()
-            else:
-                p = params
-
-            camera_motion = None
-            if prev_gray is not None:
-                camera_motion = estimate_camera_motion(prev_gray, gray)
-            prev_gray = gray.copy()
-
-            if p['blur_sigma_color'] > 0 and p['blur_sigma_space'] > 0:
-                blur = cv2.bilateralFilter(gray, p['blur_d'], p['blur_sigma_color'], p['blur_sigma_space'])
-            else:
-                blur = gray
-
-            thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                           cv2.THRESH_BINARY_INV, p['adapt_block_size'], p['adapt_c'])
-
-            kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
-            kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
-            if p['morph_open_iter'] > 0:
-                thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_small, iterations=p['morph_open_iter'])
-            if p['morph_close_iter'] > 0:
-                thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_large, iterations=p['morph_close_iter'])
-            if p['dilate_iter'] > 0:
-                thresh = cv2.dilate(thresh, kernel_large, iterations=p['dilate_iter'])
-
-            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            candidates = []
-
-            for c in cnts:
-                hull = cv2.convexHull(c)
-                area = cv2.contourArea(hull)
-                perimeter = cv2.arcLength(hull, True)
-                if perimeter == 0:
-                    continue
-
-                circularity = 4 * np.pi * (area / (perimeter * perimeter))
-
-                if p['min_area'] < area < p['max_area'] and circularity > p['min_circularity']:
-                    ((x, y), r) = cv2.minEnclosingCircle(hull)
-                    candidates.append({
-                        'x': x,
-                        'y': y,
-                        'r': r,
-                        'area': area,
-                        'hull': hull,
-                        'circularity': circularity
-                    })
-
-            candidates.sort(key=lambda k: k['circularity'], reverse=True)
-
-            final_coins = []
-            for cand in candidates:
-                is_duplicate = False
-                for existing in final_coins:
-                    dist = np.sqrt((cand['x'] - existing['x']) ** 2 + (cand['y'] - existing['y']) ** 2)
-                    avg_radius = (cand['r'] + existing['r']) / 2
-                    relative_dist = dist / avg_radius if avg_radius > 0 else dist
-
-                    if relative_dist < DUPLICATE_THRESHOLD:
-                        is_duplicate = True
-                        break
-                if not is_duplicate:
-                    final_coins.append(cand)
-
-            current_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
-
-            if camera_motion is not None:
-                for tracked in tracked_coins:
-                    try:
-                        inv_motion = cv2.invertAffineTransform(camera_motion)
-                        tx, ty = transform_point((tracked['x'], tracked['y']), inv_motion)
-                        tracked['x'] = tx
-                        tracked['y'] = ty
-                    except:
-                        pass
-
-            matched_tracked_ids = set()
-
-            for coin in final_coins:
-                best_match = None
-                best_score = float('inf')
-
-                for tracked in tracked_coins:
-                    if tracked['id'] in matched_tracked_ids:
-                        continue
-
-                    dist = np.sqrt((coin['x'] - tracked['x']) ** 2 + (coin['y'] - tracked['y']) ** 2)
-                    area_diff = abs(coin['area'] - tracked['area']) / tracked['area'] if tracked['area'] > 0 else 1
-
-                    avg_radius = (coin['r'] + tracked['r']) / 2
-                    relative_dist = dist / avg_radius if avg_radius > 0 else dist
-
-                    if relative_dist < MATCH_THRESHOLD and area_diff < AREA_DIFF_THRESHOLD:
-                        score = relative_dist + area_diff * 2
-                        if score < best_score:
-                            best_score = score
-                            best_match = tracked
-
-                if best_match is not None:
-                    alpha = 0.3
-                    best_match['x'] = alpha * coin['x'] + (1 - alpha) * best_match['x']
-                    best_match['y'] = alpha * coin['y'] + (1 - alpha) * best_match['y']
-                    best_match['r'] = alpha * coin['r'] + (1 - alpha) * best_match['r']
-                    best_match['area'] = alpha * coin['area'] + (1 - alpha) * best_match['area']
-                    best_match['last_seen'] = current_frame
-                    best_match['count'] += 1
-                    best_match['active'] = True
-                    matched_tracked_ids.add(best_match['id'])
-
-                    coin['matched_id'] = best_match['id']
-                else:
-                    is_too_close_to_existing = False
-                    for tracked in tracked_coins:
-                        dist = np.sqrt((coin['x'] - tracked['x']) ** 2 + (coin['y'] - tracked['y']) ** 2)
-                        avg_radius = (coin['r'] + tracked['r']) / 2
-                        relative_dist = dist / avg_radius if avg_radius > 0 else dist
-
-                        if relative_dist < DUPLICATE_THRESHOLD * 1.5:
-                            area_diff = abs(coin['area'] - tracked['area']) / tracked['area'] if tracked[
-                                                                                                     'area'] > 0 else 1
-                            if area_diff < AREA_DIFF_THRESHOLD * 1.2:
-                                is_too_close_to_existing = True
-                                coin['matched_id'] = tracked['id']
-                                break
-
-                    if not is_too_close_to_existing:
-                        coin['id'] = next_coin_id
-                        coin['last_seen'] = current_frame
-                        coin['first_seen'] = current_frame
-                        coin['count'] = 1
-                        coin['active'] = True
-                        coin['matched_id'] = next_coin_id
-                        tracked_coins.append(coin)
-                        next_coin_id += 1
-
-            for tracked in tracked_coins:
-                if current_frame - tracked['last_seen'] > 5:
-                    tracked['active'] = False
-
-            tracked_coins = [t for t in tracked_coins if current_frame - t['last_seen'] < FORGET_FRAMES]
-
-            display = frame.copy()
-            for coin in final_coins:
-                x, y, r = int(coin['x']), int(coin['y']), int(coin['r'])
-
-                if 'matched_id' in coin:
-                    color = (0, 255, 0)
-                else:
-                    color = (0, 165, 255)
-
-                cv2.circle(display, (x, y), r, color, 2)
-                cv2.circle(display, (x, y), 2, (0, 0, 255), -1)
-                cv2.drawContours(display, [coin['hull']], -1, (255, 0, 0), 1)
-
-                if 'matched_id' in coin:
-                    cv2.putText(display, f"#{coin['matched_id']}", (x - 20, y - int(r) - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-                cv2.putText(display, f"{int(coin['area'])}", (x - 20, y + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-
-            confirmed = [t for t in tracked_coins if t['count'] >= MIN_OBSERVATIONS]
-            active_confirmed = [t for t in confirmed if t['active']]
-
-            cv2.putText(display, f"In frame: {len(final_coins)}", (10, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            cv2.putText(display, f"Active: {len(active_confirmed)}", (10, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-            cv2.putText(display, f"Total unique: {len(confirmed)}", (10, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
-            cv2.putText(display, f"Video: {index} | Frame: {int(current_frame)}", (10, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-            if tuning_mode:
-                cv2.putText(display, "TUNING MODE", (10, 195),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-
-        cv2.imshow('1. Original', frame)
-        cv2.imshow('2. Blur', blur)
-        cv2.imshow('3. Threshold', thresh)
-        cv2.imshow('4. Detection', display)
-
-        key = cv2.waitKey(25 if not paused else 0) & 0xFF
-
-        if key == ord('q'):
-            return 'quit'
-        elif key == ord(' '):
-            paused = not paused
-        elif key == ord('n'):
+    while True:
+        ret, frame = cap.read()
+        if not ret:
             break
-        elif key == ord('r'):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            tracked_coins = []
-            next_coin_id = 0
-            prev_gray = None
-        elif key == ord('s') and tuning_mode:
-            current = get_current_params()
-            print("\n" + "=" * 60)
-            print("ЗБЕРЕЖЕНІ ПАРАМЕТРИ:")
-            for k, v in current.items():
-                print(f"  '{k}': {v},")
-            print("=" * 60 + "\n")
 
-    confirmed = [t for t in tracked_coins if t['count'] >= MIN_OBSERVATIONS]
+        frame = cv2.resize(frame, (640, 720), interpolation=cv2.INTER_CUBIC)
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    print(f"\n{'=' * 60}")
-    print(f"Відео {index} - ФІНАЛЬНИЙ РЕЗУЛЬТАТ:")
-    print(f"Всього унікальних монет на столі: {len(confirmed)}")
-    print(f"\nДеталі по кожній монеті:")
-    for coin in sorted(confirmed, key=lambda c: c['id']):
-        print(f"  Монета #{coin['id']:2d}: "
-              f"спостережень={coin['count']:3d}, "
-              f"area={coin['area']:6.0f}, "
-              f"pos=({coin['x']:5.1f}, {coin['y']:5.1f})")
-    print(f"{'=' * 60}\n")
+        # --- ВАЖЛИВО: ОНОВЛЕННЯ РУХУ ---
+        if prev_gray is not None:
+            tracker.update_camera_motion(prev_gray, gray)
 
-    return 'continue'
+        # Зберігаємо поточний кадр як попередній для наступної ітерації
+        prev_gray = gray.copy()
+        # -------------------------------
 
+        # Обробка зображення
+        blur = cv2.bilateralFilter(gray, 9, 33, 33)
+        thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 9, 3)
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-print("=" * 60)
-print("Система підрахунку монет з відстеженням")
-print("=" * 60)
-print("\nВиберіть режим:")
-print("  1 - Режим НАЛАШТУВАННЯ (з трекбарами)")
-print("  2 - Звичайний режим")
-print("=" * 60)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_small, iterations=2)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_large, iterations=2)
+        thresh = cv2.dilate(thresh, kernel_large, iterations=2)
 
-mode = input("Оберіть режим (1 або 2): ").strip()
-tuning_mode = (mode == "1")
+        # Пошук монет
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detections = []
 
-if tuning_mode:
-    setup_trackbars()
-    print("\nРежим налаштування активовано!")
-    print("\nКерування:")
-    print("  Пробіл - пауза/продовження")
-    print("  S - зберегти параметри")
-    print("  N - наступне відео")
-    print("  R - перезапустити відео")
-    print("  Q - вихід")
-else:
-    print("\nЗвичайний режим")
-    print("\nКерування:")
-    print("  Пробіл - пауза/продовження")
-    print("  N - наступне відео")
-    print("  R - перезапустити відео")
-    print("  Q - вихід")
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if params['min_area'] < area < params['max_area']:
+                perimeter = cv2.arcLength(c, True)
+                if perimeter == 0: continue
+                circularity = 4 * np.pi * (area / (perimeter ** 2))
 
-print("=" * 60 + "\n")
+                if circularity > params['min_circularity']:
+                    ((x, y), r) = cv2.minEnclosingCircle(c)
+                    # Відсікаємо краї (там часто помилки)
+                    if r > 10 and x > 10 and x < w - 10 and y > 10 and y < h - 10:
+                        detections.append({'x': x, 'y': y, 'r': r})
 
-for i in range(10):
-    cap = cv2.VideoCapture(f"Var1/Tests/test_{i}.mp4")
+        # Оновлення логіки трекера
+        tracker.process_detections(detections)
 
-    if not cap.isOpened():
-        print(f"Не вдалося відкрити test_{i}.mp4")
-        continue
+        # Візуалізація результату на кадрі
+        for det in detections:
+            color = (0, 255, 0) if not det.get('is_new', True) else (0, 0, 255)
+            cv2.circle(frame, (int(det['x']), int(det['y'])), int(det['r']), color, 2)
+            cv2.putText(frame, f"#{det.get('id', '?')}", (int(det['x']), int(det['y'])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-    result = check_video(cap, i, tuning_mode)
+        # Візуалізація карти
+        map_vis = tracker.draw_map(w, h)
+
+        cv2.imshow("Result", frame)
+        cv2.imshow("Map", map_vis)
+        cv2.imshow("Mask", thresh)
+
+        key = cv2.waitKey(20)
+        if key == ord('q'):
+            break
+
     cap.release()
+    cv2.destroyAllWindows()
 
-    if result == 'quit':
-        break
+    final_count = len([c for c in tracker.coins if c['seen_count'] > 10])
+    print(f"Відео {index}: Унікальних монет: {final_count}")
 
-cv2.destroyAllWindows()
+
+# ЗАПУСК
+print("Start processing...")
+for i in range(10):
+    # Перевірте, чи існує файл перед запуском
+    import os
+
+    fname = f'Var1/Tests/test_{i}.mp4'
+    if os.path.exists(fname):
+        process_video(fname, i)
+    else:
+        print(f"File {fname} not found.")
